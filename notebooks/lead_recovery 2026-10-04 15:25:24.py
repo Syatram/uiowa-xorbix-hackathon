@@ -14,6 +14,11 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Install databricks-openai
+# MAGIC %pip install databricks-openai
+
+# COMMAND ----------
+
 import json
 import re
 import uuid
@@ -429,8 +434,8 @@ if run_mode == "review_only":
     print("Applied requested review/outcome updates without calling the model.")
 elif eligible_count and widget("model_name"):
     try:
-        from databricks.sdk import WorkspaceClient
-        client = WorkspaceClient().serving_endpoints.get_open_ai_client()
+        from databricks_openai import DatabricksOpenAI
+        client = DatabricksOpenAI()
         summary, events = run_agent(client, widget("model_name"), {
             "get_candidates": get_candidates, "inspect_lead": inspect_lead,
             "estimate_opportunity": estimate_opportunity, "propose_tasks": propose_tasks,
