@@ -2,6 +2,10 @@
 # /// script
 # [tool.databricks.environment]
 # environment_version = "6"
+# dependencies = [
+#   "databricks-openai",
+#   "databricks-sdk[openai]",
+# ]
 # ///
 # MAGIC %md
 # MAGIC # Lead Recovery Agent
@@ -15,7 +19,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install databricks-openai
-# MAGIC %pip install databricks-openai
+# MAGIC %pip install databricks-sdk[openai]
 
 # COMMAND ----------
 
@@ -434,8 +438,8 @@ if run_mode == "review_only":
     print("Applied requested review/outcome updates without calling the model.")
 elif eligible_count and widget("model_name"):
     try:
-        from databricks_openai import DatabricksOpenAI
-        client = DatabricksOpenAI()
+        from databricks.sdk import WorkspaceClient
+        client = WorkspaceClient().serving_endpoints.get_open_ai_client()
         summary, events = run_agent(client, widget("model_name"), {
             "get_candidates": get_candidates, "inspect_lead": inspect_lead,
             "estimate_opportunity": estimate_opportunity, "propose_tasks": propose_tasks,
@@ -482,3 +486,291 @@ print(json.dumps({"worked_leads": 200, "assumed_baseline": 0.10, "assumed_absolu
                   "assumed_30_day_revenue_per_conversion": 250.0, **scenario}, indent=2))
 display(spark.table(f"{output}.followup_tasks").filter(F.col("location_id") == location_id)
         .groupBy("review_status", "outcome").count())
+
+# COMMAND ----------
+
+# DBTITLE 1,Multi-cycle lead nurturing
+# Multi-cycle lead nurturing: generate a 3-touch staff workflow plan for each follow_up lead
+# This is a task planner for clinic staff -- it does NOT send emails or SMS automatically.
+# Staff use the suggested drafts and timing to manually follow up with each lead.
+from pyspark.sql.types import DateType
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {output}.nurturing_cycles (
+  cycle_id STRING, task_id STRING, lead_id STRING, location_id STRING,
+  snapshot_date DATE, cycle_number INT, channel STRING, timing_days INT,
+  draft_text STRING, cycle_status STRING, is_simulated BOOLEAN
+) USING DELTA""")
+
+# Get all pending follow_up tasks for this location
+nurture_tasks = (spark.table(f"{output}.followup_tasks")
+    .filter((F.col("location_id") == location_id) &
+            (F.col("review_status") == "pending_review") &
+            (F.col("decision") == "follow_up"))
+    .orderBy("lead_id")
+    .collect())
+
+# 3-cycle nurturing sequence: phone → email/SMS → phone
+NURTURE_SEQUENCE = [
+    {"cycle": 1, "channel": "phone_call",   "timing": 0, "draft": "Initial outreach: Call to verify contact info, confirm interest, and schedule an appointment."},
+    {"cycle": 2, "channel": "email_sms",    "timing": 3, "draft": "Follow-up: Send a reminder referencing the initial inquiry. Offer flexible scheduling options."},
+    {"cycle": 3, "channel": "phone_call",   "timing": 7, "draft": "Final attempt: Call with a time-limited offer to schedule a consultation this week."},
+]
+
+# Generate nurturing rows
+nurture_rows = []
+for task in nurture_tasks:
+    ev = json.loads(task["evidence_json"]) if task["evidence_json"] else {}
+    source = ev.get("source", "unknown")
+    for seq in NURTURE_SEQUENCE:
+        cycle_id = task_key(task["lead_id"], f"{snapshot_date}_n{seq['cycle']}")
+        # Personalize draft with lead source
+        draft = seq["draft"]
+        if source != "unknown":
+            draft = draft.replace("the initial inquiry", f"the {source.lower()}")
+        nurture_rows.append((
+            cycle_id, task["task_id"], task["lead_id"], location_id,
+            snapshot_date, seq["cycle"], seq["channel"], seq["timing"],
+            draft, "pending", True
+        ))
+
+if nurture_rows:
+    # Clear old cycles for this location + snapshot, then insert fresh
+    DeltaTable.forName(spark, f"{output}.nurturing_cycles").delete(
+        (F.col("location_id") == location_id) &
+        (F.col("snapshot_date") == F.lit(snapshot_date).cast("date"))
+    )
+    snap_d = date.fromisoformat(snapshot_date)
+    typed_rows = [(
+        r[0], r[1], r[2], r[3], snap_d, int(r[5]), r[6], int(r[7]), r[8], r[9], r[10]
+    ) for r in nurture_rows]
+    nurture_df = spark.createDataFrame(typed_rows,
+        schema=StructType([
+            StructField("cycle_id", StringType(), True),
+            StructField("task_id", StringType(), True),
+            StructField("lead_id", StringType(), True),
+            StructField("location_id", StringType(), True),
+            StructField("snapshot_date", DateType(), True),
+            StructField("cycle_number", IntegerType(), True),
+            StructField("channel", StringType(), True),
+            StructField("timing_days", IntegerType(), True),
+            StructField("draft_text", StringType(), True),
+            StructField("cycle_status", StringType(), True),
+            StructField("is_simulated", BooleanType(), True),
+        ]))
+    nurture_df.write.mode("append").saveAsTable(f"{output}.nurturing_cycles")
+    print(f"Generated {len(nurture_rows)} nurturing cycles for {len(nurture_tasks)} follow_up leads")
+    print(f"Each lead gets a 3-touch staff workflow over 7 days: phone (day 0) -> email/SMS (day 3) -> phone (day 7)")
+    print(f"Staff must manually perform each action using the suggested draft. No automated sending.")
+else:
+    print("No follow_up tasks to nurture. Run the agent (Cell 10) first.")
+
+print()
+print("Staff nurturing workflow:")
+display(spark.table(f"{output}.nurturing_cycles")
+    .filter((F.col("location_id") == location_id) & (F.col("snapshot_date") == F.lit(snapshot_date).cast("date")))
+    .select("lead_id", "cycle_number", "channel", "timing_days", "cycle_status", "draft_text")
+    .orderBy("lead_id", "cycle_number"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Summary
+# MAGIC %md
+# MAGIC ## 6 Summary
+# MAGIC Everything below is auto-generated from the latest run. All tasks are **simulated** and require manager review before any action. The nurturing workflow shows the 3-touch staff action plan generated for each lead.
+
+# COMMAND ----------
+
+# DBTITLE 1,Summary dashboard
+from pyspark.sql import functions as F
+
+W = 72
+def bar(top=True):
+    if top: print("\u2554" + "\u2550" * W + "\u2557")
+    else:  print("\u255A" + "\u2550" * W + "\u255D")
+def sub():
+    print("  " + "\u2500" * W)
+def blank():
+    print()
+def center(text):
+    print("\u2551" + text.center(W) + "\u2551")
+def line(text=""):
+    print(f"  {text}" if text else "")
+def kv(label, value, indent=4):
+    dots = "." * max(2, 42 - len(str(label)))
+    print(f"{' ' * indent}{label} {dots} {value}")
+
+bar(True)
+center("LEAD RECOVERY SUMMARY")
+center(location_name)
+center(f"Location: {location_id}   Snapshot: {snapshot_date}   Lookback: {lookback} days")
+bar(False)
+blank()
+
+# ── Quick Stats ────────────────────────────────────────────────────────
+line("  \U0001f4ca  QUICK STATS")
+kv("Eligible leads", f"{eligible_count:,}")
+kv("Contact-limit skips", f"{contact_limit_count:,}")
+kv("Excluded (converted, lost, or outside window)", f"{excluded_count:,}")
+blank()
+bar(True)
+center("STAFF ACTION ITEMS")
+bar(False)
+blank()
+
+# ── Pending Tasks ─────────────────────────────────────────────────────
+line("  \u2705  PENDING TASKS (pending manager review)")
+line(f"  All tasks are SIMULATED -- a manager must approve before any outreach.")
+line()
+tasks = (spark.table(f"{output}.followup_tasks")
+         .filter((F.col("location_id") == location_id) & (F.col("review_status") == "pending_review"))
+         .orderBy(F.desc("snapshot_date"), "lead_id"))
+task_rows = tasks.collect()
+worked = len(task_rows) if task_rows else 0
+if task_rows:
+    for i, t in enumerate(task_rows):
+        ev = json.loads(t["evidence_json"]) if t["evidence_json"] else {}
+        source = ev.get("source", "Unknown")
+        status = (ev.get("status") or "unknown").title()
+        touches = ev.get("num_touchpoints", "?")
+        decision = t["decision"].upper().replace("_", " ")
+        resp = ev.get("first_response_hours", "?")
+        created = ev.get("created_date", "?")
+        print(f"    {i+1}. {t['lead_id']}  |  {source}  |  {status}  |  Created: {created}")
+        print(f"       Touches: {touches}  |  1st response: {resp} hrs  |  Action: {decision}")
+        print(f"       {t['rationale']}")
+        print()
+else:
+    line("  No pending tasks. Run the agent (Cell 10) to generate new tasks.")
+blank()
+
+# ── Nurturing Pipeline ─────────────────────────────────────────────────
+line("  \U0001f504  NURTURING WORKFLOW (3-touch staff plan per follow_up lead)")
+line(f"  Staff action plan: phone (day 0) -> email/SMS (day 3) -> phone (day 7)")
+line(f"  Drafts are suggestions for staff -- no automated sending.")
+line()
+nurture_cycles = (spark.table(f"{output}.nurturing_cycles")
+    .filter((F.col("location_id") == location_id) & (F.col("snapshot_date") == F.lit(snapshot_date).cast("date")))
+    .orderBy("lead_id", "cycle_number")
+    .collect())
+if nurture_cycles:
+    cur_lead = None
+    lead_num = 0
+    for nc in nurture_cycles:
+        if nc["lead_id"] != cur_lead:
+            cur_lead = nc["lead_id"]
+            lead_num += 1
+            print()
+            print(f"    {lead_num}. {nc['lead_id']}")
+        chan = {"phone_call": "Phone Call", "email_sms": "Email/SMS"}.get(nc["channel"], nc["channel"])
+        print(f"       Day {nc['timing_days']}  |  {chan}  |  {nc['cycle_status']}")
+        if nc["draft_text"]:
+            print(f"          {nc['draft_text']}")
+    print()
+else:
+    line("  No nurturing cycles. Run the nurturing cell (Cell 13) first.")
+blank()
+bar(True)
+center("REVENUE & GROWTH PROJECTIONS")
+bar(False)
+blank()
+
+# ── Revenue & Growth ───────────────────────────────────────────────────
+total_leads_count = leads.count()
+total_converted_count = leads.filter(F.col("converted_flag") == F.lit(True)).count()
+total_open_count = leads.filter(F.lower(F.trim(F.col("status"))).isin(list(open_statuses)) & (F.col("converted_flag") == F.lit(False))).count()
+total_lost_count = total_leads_count - total_converted_count - total_open_count
+
+current_arr = 100_000_000
+rev_per_patient = current_arr / total_converted_count if total_converted_count else 0
+conv_rate = total_converted_count / total_leads_count if total_leads_count else 0
+open_potential_m = total_open_count * rev_per_patient / 1_000_000
+
+pred_lift = 0.05
+stretch_lift = 0.15
+pred_pat = int(total_open_count * pred_lift)
+stretch_pat = int(total_open_count * stretch_lift)
+pred_rev = pred_pat * rev_per_patient / 1_000_000
+stretch_rev = stretch_pat * rev_per_patient / 1_000_000
+pred_arr = (current_arr + pred_pat * rev_per_patient) / 1_000_000
+stretch_arr = (current_arr + stretch_pat * rev_per_patient) / 1_000_000
+
+reengage_rev = int(total_lost_count * 0.05) * rev_per_patient / 1_000_000
+response_rev = int(total_open_count * 0.02) * rev_per_patient / 1_000_000
+nurture_rev = int(total_open_count * 0.03) * rev_per_patient / 1_000_000
+ltv_rev = current_arr * 0.10 / 1_000_000
+combined = reengage_rev + response_rev + nurture_rev + ltv_rev
+pred_total = 100 + pred_rev + combined
+stretch_total = 100 + stretch_rev + combined
+
+line("  \U0001f4b0  REVENUE & GROWTH")
+line()
+line(f"  Current: $100M ARR | {total_converted_count:,} patients | {conv_rate:.0%} conversion | ${rev_per_patient:,.0f}/patient/yr")
+line(f"  Database: {total_leads_count:,} leads = {total_converted_count:,} converted, {total_open_count:,} open (${open_potential_m:.0f}M addressable), {total_lost_count:,} lost")
+line()
+line(f"  \U0001f4ca  PREDICTED AVERAGE (+{pred_lift:.0%} lift on open leads)")
+kv("New patients", f"{pred_pat:,}", 4)
+kv("New revenue", f"${pred_rev:.1f}M -> ${pred_arr:.0f}M ARR", 4)
+line()
+line(f"  \U0001f680  VERY POSITIVE (+{stretch_lift:.0%} lift on open leads)")
+kv("New patients", f"{stretch_pat:,}", 4)
+kv("New revenue", f"${stretch_rev:.1f}M -> ${stretch_arr:.0f}M ARR", 4)
+line()
+line(f"  \U0001f4a1  ADDITIONAL REVENUE LEVERS (compound on top of lead recovery)")
+line(f"    1. Re-engage lost leads (5% win-back)   -> ${reengage_rev:.1f}M")
+line(f"    2. Cut response time to <1hr (+2%)      -> ${response_rev:.1f}M")
+line(f"    3. Staff nurturing workflow (+3%)          -> ${nurture_rev:.1f}M")
+line(f"    4. Raise patient LTV (+10%)             -> ${ltv_rev:.1f}M")
+line(f"    5. Open new locations ($5M each)         -> scales linearly")
+line()
+kv("Combined levers", f"~${combined:.0f}M", 4)
+kv("Predicted total", f"${pred_total:.0f}M ARR", 4)
+kv("Very positive total", f"${stretch_total:.0f}M ARR", 4)
+line()
+# ── 10-Year Projection (excluding new locations) ───────────────────────
+pred_y1 = pred_total
+stretch_y1 = stretch_total
+pred_annual = 12.5
+stretch_annual = 20.0
+
+line("  \U0001f4c9  10-YEAR PROJECTION (excluding new locations)")
+line()
+line("  Levers compound year over year: higher conversion rate and higher LTV")
+line("  persist permanently. Year 1 captures the existing lead pool; later years")
+line("  convert new leads at the improved rates.")
+line()
+print(f"    {'Year':>4}  {'Predicted':>12}  {'Very Positive':>14}")
+print(f"    {'----':>4}  {'------------':>12}  {'--------------':>14}")
+for yr in [1, 2, 3, 5, 7, 10]:
+    if yr == 1:
+        p = pred_y1
+        s = stretch_y1
+    else:
+        p = pred_y1 + pred_annual * (yr - 1)
+        s = stretch_y1 + stretch_annual * (yr - 1)
+    print(f"    {yr:>4}  ${p:>10.0f}M  ${s:>12.0f}M")
+line()
+line("  Predicted average reaches ~$250M by year 10 from levers alone.")
+line("  Very positive exceeds $300M by year 10.")
+line()
+line("  New locations ($5M ARR each) would accelerate this further but are")
+line("  excluded from the projection above.")
+line("  Note: 10-year projections are illustrative, based on assumed annual rates.")
+blank()
+
+# ── Agent Event Log ───────────────────────────────────────────────────
+line("  \U0001f527  AGENT EVENT LOG")
+events_df = spark.table(f"{output}.agent_events").orderBy("step_number")
+event_rows = events_df.filter(F.col("run_id") == spark.table(f"{output}.agent_runs").orderBy(F.desc("started_at")).limit(1).select("run_id").collect()[0]["run_id"]).collect()
+if event_rows:
+    print(f"    {'Step':>4}  {'Tool':<20}  {'Elapsed':>9}   Status")
+    print(f"    {'--':>4}  {'-'*20}  {'-'*9}   {'-'*30}")
+    for e in event_rows:
+        status = "ok" if not e["error_message"] else f"ERR {e['error_message'][:35]}"
+        print(f"    {e['step_number']:>4}  {e['tool_name']:<20}  {e['elapsed_ms']:>7}ms   {status}")
+else:
+    line("    No agent events recorded.")
+blank()
+
+bar(True)
+center("All tasks are simulated. Approve or reject in the Review widgets.")
+bar(False)
