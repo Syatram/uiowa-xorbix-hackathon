@@ -1,0 +1,4 @@
+pyspark==4.2.0
+databricks-sdk==0.147.0
+databricks-openai==0.17.1
+flask==1.0.3
