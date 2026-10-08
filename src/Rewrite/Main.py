@@ -11,13 +11,12 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import (BooleanType, IntegerType, LongType, StringType,
                                StructField, StructType, TimestampType)
 
+from Rewrite.Enums import Decisions, Outcomes
 from delta.tables import DeltaTable
-
 from databricks.sdk import WorkspaceClient, dbutils
 
-from LeadRecoveryAgent import LeadRecoveryAgent, LeadRecoveryAgentBuilder
-from Enums import Outcomes, ReviewStates, Decisions
-
+from Rewrite.LeadRecoveryAgent import LeadRecoveryAgent, LeadRecoveryAgentBuilder
+from Rewrite.Enums import ReviewStates
 ### Constants ###
 
 # System prompt
@@ -63,18 +62,17 @@ def validate_identifier(value : str) -> str:
 def validate_snapshot(value : str) -> date:
     return date.isoformat(value)
 
-def evaluate_leads(leads : DataFrame, locations : DataFrame):
-   lead_duplicates = leads.groupBy("lead_id").count().filter("lead_id IS NULL OR count > 1").limit(1).count()
-   location_duplicates = locations.groupBy("location_id").count().filter("location_id IS NULL OR count > 1").limit(1).count()
+def do_duplicate_leads_exist(leads : DataFrame):
+    lead_duplicates = leads.groupBy("lead_id").count().filter("lead_id IS NULL OR count > 1").limit(1).count()
 
-   if lead_duplicates:
-       raise ValueError("Lead keys are null/duplicated")
+    return lead_duplicates > 0
 
-   if location_duplicates:
-       raise ValueError("Location keys are null/duplicated")
+def do_duplicate_locations_exist(locations : DataFrame):
+    location_duplicates = locations.groupBy("location_id").count().filter("location_id IS NULL OR count > 1").limit(1).count()
 
+    return location_duplicates > 0
 
-def get_all_widget_values() -> dict[str, str | date | int | list[str]]:
+def get_all_widget_values() -> dict[str, str | date | int | list[str]]: 
     for k, v in WIDGETS:
         dbutils.widgets.text(k, v)
 
@@ -104,7 +102,6 @@ def get_all_widget_values() -> dict[str, str | date | int | list[str]]:
     if not open_statuses:
         raise ValueError("Open status not set")
 
-    evaluate_leads(spark.table(f))
 
     return {
         "catalog" : catalog,
@@ -119,6 +116,7 @@ def get_all_widget_values() -> dict[str, str | date | int | list[str]]:
 
 def task_key(lead_id: str, snapshot_date: str) -> str:
     return hashlib.sha256(f"lead_followup|{snapshot_date}|{lead_id}".encode()).hexdigest()
+
 
 
 def classify(lead: dict[str, Any], open_statuses: list[str], terminal_statuses: list[str]) -> tuple[str, str]:
