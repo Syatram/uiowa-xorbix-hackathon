@@ -8,30 +8,13 @@ w = WorkspaceClient()
 
 SOURCE = "workspace.chiro_hackathon"
 OUTPUT = "workspace.chiro_agent_demo"
+WH_ID = "57129d05302f658f"  # hardcoded SQL warehouse ID
 
 # --- SQL helpers ---
 
-_wh_cache = None
-def warehouse_id():
-    global _wh_cache
-    if _wh_cache:
-        return _wh_cache
-    whs = list(w.warehouses.list())
-    if not whs:
-        return None
-    for wh in whs:
-        if wh.state == "RUNNING":
-            _wh_cache = wh.id
-            return _wh_cache
-    _wh_cache = whs[0].id
-    return _wh_cache
-
 def run_sql(sql_text):
-    wid = warehouse_id()
-    if not wid:
-        raise RuntimeError("No SQL warehouse found. Create and start a SQL warehouse in your workspace.")
     resp = w.statement_execution.execute_statement(
-        statement=sql_text, warehouse_id=wid, wait_timeout="50s"
+        statement=sql_text, warehouse_id=WH_ID, wait_timeout="50s"
     )
     if not resp.result or not resp.result.data_array:
         return []
@@ -203,6 +186,29 @@ def index():
     except Exception as e:
         import traceback
         return render_template_string(FORM_HTML, locations=locs, error=f"{e}<br><pre>{traceback.format_exc()}</pre>")
+
+@app.route("/debug")
+def debug():
+    import html as _html
+    info = []
+    info.append("<h2>Environment</h2>")
+    for k in sorted(os.environ):
+        if "TOKEN" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
+            info.append(f"<code>{k}</code> = <i>(hidden)</i><br>")
+        else:
+            info.append(f"<code>{k}</code> = {_html.escape(str(os.environ[k]))}<br>")
+    info.append("<h2>SQL Test</h2>")
+    try:
+        info.append(f"<p>WorkspaceClient host: {w.config.host}</p>")
+        rows = run_sql(f"SELECT location_id, location_name FROM {SOURCE}.locations ORDER BY location_id LIMIT 3")
+        info.append(f"<p>Query returned {len(rows)} rows:</p>")
+        for r in rows:
+            info.append(f"<p>{_html.escape(str(r))}</p>")
+    except Exception as e:
+        import traceback
+        info.append(f"<p style='color:red'>ERROR: {_html.escape(str(e))}</p>")
+        info.append(f"<pre>{_html.escape(traceback.format_exc())}</pre>")
+    return "\n".join(info)
 
 # --- Templates ---
 

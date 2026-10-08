@@ -1,0 +1,45 @@
+# Declarative Automation Bundle for Lead Recovery App
+# Deploy with: databricks bundle deploy --target dev
+# Validate with: databricks bundle validate --target dev
+
+bundle:
+  name: lead-recovery-app
+
+variables:
+  warehouse_id:
+    description: SQL warehouse ID for the app
+    default: 57129d05302f658f
+  source_catalog:
+    description: Catalog with chiro_hackathon schema
+    default: workspace
+  output_catalog:
+    description: Catalog for agent demo tables
+    default: workspace
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      warehouse_id: 57129d05302f658f
+
+resources:
+  apps:
+    lead-recovery-app:
+      name: lead-recovery-app
+      description: Lead Recovery App with agentic next-action recommendations
+      source_code_path: ./
+      config:
+        command:
+          - python
+          - app_v2.py
+      access:
+        - sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+
+# NOTE: The app is already deployed in this workspace.
+# This bundle config documents the deployment and enables
+# reproducible redeployment. The SQL warehouse ID and catalog
+# names are parameterized for workspace-specific values.
+# Replace the warehouse_id default with your warehouse ID.
