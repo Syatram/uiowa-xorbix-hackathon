@@ -15,85 +15,10 @@ from delta.tables import DeltaTable
 
 from databricks.sdk import WorkspaceClient, dbutils
 
-import LeadRecoveryAgent
+from LeadRecoveryAgent import LeadRecoveryAgent, LeadRecoveryAgentBuilder
 from Enums import Outcomes, ReviewStates, Decisions
 
 ### Constants ###
-
-# Tools the agent has access to
-TOOLS = [
-    {
-        "type" : " function",
-        "name" : "get_candidates",
-        "description" : "Get at most 20 eligible lead IDs and evidence for one location.",
-        "parameters" : {
-            "type" : "object",
-            "properties" : {
-                "location_id" : {
-                    "type" : "string"
-                },
-                "limit" : {
-                    "type" : "integer"                    
-                }
-            },
-            "required" : ["location_id", "limit"]
-        }
-    },
-
-    {
-        "type" : "function",
-        "name" : "inspect_lead",
-        "description" : "Inspect one ID returned by get_candidates.",
-        "parameters" : {
-            "type" : "object",
-            "properties" : {
-                "lead_id" : {
-                    "type" : "string"
-                }
-            },
-            "required" : ["lead_id"]
-        }
-    },
-
-    {
-        "type" : "function",
-        "name" : "estimate_opportunity",
-        "description" : "Calculate a clearly labeled revenue scenario from validated assumptions.",
-        "parameters" : {
-            "type" : "object",
-            "properties" : {
-                "worked_leads" : {
-                    "type" : "integer"
-                },
-                "baseline" : {
-                    "type" : "number"
-                },
-                "uplift" : {
-                    "type" : "number"
-                },
-                "revenue_per_conversion" : {
-                    "type" : "number"
-                }
-            },
-            "required" : ["worked_leads", "baseline", "uplift", "revenue_per_conversion"]
-        }
-    },
-
-    {
-        "type" : "function",
-        "name" : "propose_task",
-        "description" : "Inspect one ID returned by get_candidates.",
-        "parameters" : {
-            "type" : "object",
-            "properties" : {
-                "lead_id" : {
-                    "type" : "string"
-                }
-            },
-            "required" : ["lead_id"]
-        }
-    }
-]
 
 # System prompt
 SYSTEM = ("You assist a clinic manager using synthetic data. First call get_candidates, then inspect each lead before proposing. "
@@ -230,9 +155,39 @@ def classify(lead: dict[str, Any], open_statuses: list[str], terminal_statuses: 
 
     return Decisions.STAFF_REVIEW, "Could not classify"
 
+def get_candidates():
+    """Get at most 20 eligible lead IDs and evidence for one location."""
+    print()
+
+def inspect_lead():
+    """Inspect one ID returned by get_candidates."""
+    print()
+
+def estimate_opportunity():
+    """Calculate a clearly labeled revenue scenario from validated assumptions."""
+    print()
+
+def propose_task():
+    """Validate and save simulated pending tasks for inspected leads."""
+    print()
+
 def init():
+    client = WorkspaceClient().serving_endpoints.get_open_ai_client()
     widgets = get_all_widget_values()
 
+    agent_builder = LeadRecoveryAgentBuilder(client, widgets.get("model_name"))
+    agent_builder.with_lead_limit(widgets.get("lead_limit"))
+    agent_builder.with_location_id(widgets.get("location_id"))
+    agent_builder.with_system_prompt(SYSTEM)
+    agent_builder.with_tools({
+        "get_candidates" : get_candidates,
+        "inspect_lead" : inspect_lead,
+        "estimate_opportunity" : estimate_opportunity,
+        "propose_task": propose_task
+    })
 
+    agent = LeadRecoveryAgent(agent_builder)
+
+    agent.run()
 
 init()
